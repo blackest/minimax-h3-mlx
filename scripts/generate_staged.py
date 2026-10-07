@@ -50,6 +50,7 @@ from minimax_h3_mlx.load import (
 )
 from minimax_h3_mlx.media import (
     mux_audio_onto_video,
+    probe_media,
     probe_video_frames,
     read_audio,
     read_video_frames,
@@ -304,6 +305,11 @@ def drive_slice(wave: np.ndarray, start_frame: int, num_frames: int) -> np.ndarr
     return np.ascontiguousarray(piece)
 
 
+# Longest --extend-from / --video-to-audio source, in seconds: a minute at 1024x576 is ~2.5 GB of
+# decoded frames, which stays resident for the whole render.
+MEDIA_SOURCE_MAX_SECONDS = 60.0
+
+
 def media_mode_errors(args, parser) -> str:
     """Validate the media-conditioned flags together; return the run's mode name."""
     if args.chain_context_frames < 0 or args.chain_context_frames % CONTEXT_FRAME_STEP:
@@ -323,6 +329,17 @@ def media_mode_errors(args, parser) -> str:
             parser.error(f"{flag} does not exist: {value}")
     if args.extend_frames is not None and args.extend_from is None:
         parser.error("--extend-frames only applies with --extend-from")
+    for flag, value in (("--extend-from", args.extend_from), ("--video-to-audio", args.video_to_audio)):
+        # The whole source is decoded onto the canvas and held through the render (it is stitched
+        # in front of the new part, or is the held picture), so its length is bounded up front.
+        if value is not None:
+            try:
+                seconds = float(probe_media(value).get("duration") or 0.0)
+            except RuntimeError as exc:
+                parser.error(f"{flag}: {exc}")
+            if seconds > MEDIA_SOURCE_MAX_SECONDS:
+                parser.error(f"{flag} takes clips up to {MEDIA_SOURCE_MAX_SECONDS:.0f}s; "
+                             f"{value} is {seconds:.1f}s — cut it shorter first")
     if args.audio_mux is not None and args.audio_drive is None:
         parser.error("--audio-mux only applies with --audio-drive")
     if args.video_to_audio is not None and (
@@ -1898,14 +1915,23 @@ def main() -> int:
             )
     except RuntimeError as exc:
         parser.error(str(exc))
+    if args.extend_from is not None and args.extend_frames is not None:
+        if args.extend_frames < 1:
+            parser.error("--extend-frames must be at least 1")
+        # The flag promises exactly N new frames: take as many windows as that needs rather
+        # than silently capping it at what --chain-windows happened to say.
+        needed = -(-int(args.extend_frames) // (frames - 1))
+        if needed > args.chain_windows:
+            if args.chain_prompts is not None:
+                parser.error(f"--extend-frames {args.extend_frames} needs {needed} windows of "
+                             f"{frames} frames; --chain-prompts names {args.chain_windows}")
+            args.chain_windows = needed
     chain = args.chain_windows
     if args.extend_from is not None:
         # The source is "window 0": every new window drops its duplicated hand-over frame.
         chain_frames = len(source_video) + chain * (frames - 1)
         if args.extend_frames is not None:
-            if args.extend_frames < 1:
-                parser.error("--extend-frames must be at least 1")
-            args.chain_total_frames = min(chain_frames, len(source_video) + args.extend_frames)
+            args.chain_total_frames = len(source_video) + args.extend_frames
     else:
         chain_frames = frames + (chain - 1) * (frames - 1)
     if args.chain_total_frames is not None and not 1 <= args.chain_total_frames <= chain_frames:

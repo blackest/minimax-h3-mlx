@@ -15,6 +15,7 @@ No weights. Two layers:
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import tempfile
 from dataclasses import replace
@@ -39,6 +40,7 @@ from minimax_h3_mlx.conditioning import (  # noqa: E402
 )
 from minimax_h3_mlx.config import TAG_AUDIO, TAG_TEXT, TAG_VIDEO, DiTConfig  # noqa: E402
 from minimax_h3_mlx.dit import MiniMaxH3DiT  # noqa: E402
+from minimax_h3_mlx.media import read_video_frames  # noqa: E402
 from minimax_h3_mlx.video_vae import VideoVAE, VideoVAEConfig  # noqa: E402
 
 FAILURES: list[str] = []
@@ -199,7 +201,8 @@ def _args(**kw):
 
 def test_flag_refusals(tmp: Path) -> None:
     clip = tmp / "c.mp4"
-    clip.write_bytes(b"x")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=24",
+                    "-t", "1", "-pix_fmt", "yuv420p", str(clip)], check=True)
     img = tmp / "i.png"
     img.write_bytes(b"x")
 
@@ -221,6 +224,17 @@ def test_flag_refusals(tmp: Path) -> None:
     mode = gs.media_mode_errors(ns, _parser())
     check("extend defaults to 17 frames of context", mode == "extend" and ns.chain_context_frames == 17)
     check("plain text mode", gs.media_mode_errors(_args(), _parser()) == "text")
+    real_probe = gs.probe_media
+    try:
+        gs.probe_media = lambda path: {"duration": gs.MEDIA_SOURCE_MAX_SECONDS + 1.0}
+        check("an over-long extend source is refused", refused(extend_from=clip))
+        check("an over-long add-sound source is refused", refused(video_to_audio=clip))
+    finally:
+        gs.probe_media = real_probe
+    frames = read_video_frames(clip, 32, 32)
+    check("the streaming reader returns every frame on the canvas",
+          frames.shape == (24, 32, 32, 3) and frames.dtype == np.uint8, str(frames.shape))
+    check("max_frames caps the read", read_video_frames(clip, 32, 32, max_frames=5).shape[0] == 5)
 
 
 # ---------------------------------------------------------------------------------------------

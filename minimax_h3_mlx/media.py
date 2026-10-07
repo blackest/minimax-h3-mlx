@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
 import wave
 from pathlib import Path
 
@@ -227,16 +228,39 @@ def read_video_frames(
     if max_frames is not None:
         cmd += ["-frames:v", str(int(max_frames))]
     cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg could not decode {path}: {result.stderr.decode()[:300]}")
-    frame_bytes = width * height * 3
-    count = len(result.stdout) // frame_bytes
+    # Frames are read straight into one preallocated array (grown only if the probe
+    # under-counted), so a long clip costs its frames once, not a pipe buffer plus a copy.
+    info = probe_media(path)
+    guess = int(round(float(info.get("duration") or 0.0) * fps)) + 2
+    if max_frames is not None:
+        guess = min(guess, int(max_frames)) if guess > 2 else int(max_frames)
+    frames = np.empty((max(1, guess), height, width, 3), dtype=np.uint8)
+    count = 0
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
+        try:
+            while True:
+                if count == len(frames):
+                    frames = np.concatenate([frames, np.empty_like(frames[: max(24, count // 4)])])
+                view = memoryview(frames[count]).cast("B")
+                got = 0
+                while got < len(view):
+                    n = proc.stdout.readinto(view[got:])
+                    if not n:
+                        break
+                    got += n
+                if got < len(view):
+                    break
+                count += 1
+        finally:
+            proc.stdout.close()
+            returncode = proc.wait()
+        if returncode != 0:
+            err.seek(0)
+            raise RuntimeError(f"ffmpeg could not decode {path}: {err.read().decode()[:300]}")
     if count < 1:
         raise RuntimeError(f"{path} decoded to no video frames")
-    return np.frombuffer(result.stdout[: count * frame_bytes], dtype=np.uint8).reshape(
-        count, height, width, 3
-    ).copy()
+    return frames[:count]  # a view: the probe over-allocates by a frame or two at most
 
 
 def read_audio(
