@@ -581,7 +581,13 @@ class VideoVAE(nn.Module):
             row = []
             for j_pos, j_len in zip(x_idx, x_len):
                 tile = x[:, :, i_pos : i_pos + i_len, j_pos : j_pos + j_len, :]
-                row.append(self.quant_conv(self.encoder(tile)))
+                encoded = self.quant_conv(self.encoder(tile))
+                # One tile's activations at a time. A lazy graph over every tile evaluates them
+                # all at once, which is invisible for a one-frame keyframe and is ~16 GiB for
+                # 17 frames at 640x384 — the shape carried context and video-to-audio encode.
+                # Values are unchanged; only the evaluation order is.
+                mx.eval(encoded)
+                row.append(encoded)
             rows.append(row)
 
         ratio = self.config.spatial_compression_ratio

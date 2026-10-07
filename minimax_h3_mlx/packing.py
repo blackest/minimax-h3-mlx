@@ -249,6 +249,28 @@ def _temporal_position_span(num_latent_frames: int) -> float:
     return float(spans.sum())
 
 
+def parse_anchor(anchor: str, num_frames: int | None = None) -> tuple[str, int | None]:
+    """``"first"`` / ``"last"`` / ``"frame:<pixel index>"`` -> ``(kind, pixel_index)``.
+
+    ``"frame:0"`` is the first frame and ``"frame:<num_frames - 1>"`` the last one: the three
+    spellings put a keyframe at exactly the same rotary time, so a timed keyframe that happens to
+    land on an end of the window is the official first/last conditioning, not an approximation.
+    """
+    if anchor in ("first", "last"):
+        return anchor, None
+    kind, _, value = str(anchor).partition(":")
+    if kind != "frame" or not value.strip().lstrip("-").isdigit():
+        raise ValueError(
+            f"A keyframe anchor must be 'first', 'last' or 'frame:<index>', got {anchor!r}."
+        )
+    index = int(value)
+    if index < 0 or (num_frames is not None and index >= num_frames):
+        raise ValueError(
+            f"Keyframe anchor {anchor!r} is outside the window's 0..{(num_frames or 0) - 1} frames."
+        )
+    return "frame", index
+
+
 def build_packed_sequence(
     text_token_tags: np.ndarray | list[int],
     num_latent_frames: int,
@@ -257,27 +279,66 @@ def build_packed_sequence(
     num_audio_latents: int,
     patch_size: tuple[int, int, int],
     keyframe_anchors: tuple[str, ...] = (),
+    *,
+    history_latent_frames: int = 0,
+    history_audio_latents: int = 0,
+    history_audio_offset: float = 0.0,
 ) -> PackedSequence:
-    """Build the ``[text | keyframe conditions | target audio | target video]`` layout.
+    """Build the ``[text | video conditions | audio conditions | target audio | target video]`` layout.
 
     Args:
         text_token_tags: modality tag of every text row. Text is tagged ``1``, except the rows of a
             keyframe's vision block, which MiniMax-H3 tags ``0`` (video).
         keyframe_anchors: one entry per keyframe conditioning block, in packed order; ``"first"``
-            anchors at the first latent frame, ``"last"`` at the last.
+            anchors at the first latent frame, ``"last"`` at the last, ``"frame:<i>"`` at pixel
+            frame ``i`` of the target (rotary time ``origin + i * 5/3``, the clock every target
+            frame already lives on).
+        history_latent_frames: latent frames of *carried context* — the tail of the clip this
+            window continues — placed on the clock immediately BEFORE the target, so the target
+            starts where the history ends. They are video conditioning rows like a keyframe (same
+            noise level), packed ahead of the keyframe blocks. ``0`` reproduces the reference
+            layout exactly.
+        history_audio_latents: audio latents (per stereo channel) of carried context, starting at
+            the same instant as the video history. Packed as conditioning audio rows, channel-major
+            like the target audio, ahead of the target audio.
+        history_audio_offset: rotary units (1/40 s) by which the carried audio starts after the
+            carried video — non-zero only when the carried span is not a whole number of audio
+            latents, so the audio can end exactly where the carried picture ends.
+
+    With no history the media clock starts at the text length, exactly as the reference builds it.
+    With history the whole target moves later by the history's rotary span; the audio of both
+    keeps the shared 40-units-per-second clock, so carried sound and carried picture stay in sync.
     """
     _, ph, pw = patch_size
     text_tags = np.asarray(text_token_tags, dtype=np.int64)
     rows_per_frame = (latent_height // ph) * (latent_width // pw)
     num_text = int(text_tags.shape[0])
-    num_condition_rows = len(keyframe_anchors) * rows_per_frame
+    num_history_rows = int(history_latent_frames) * rows_per_frame
+    num_condition_rows = num_history_rows + len(keyframe_anchors) * rows_per_frame
+    num_condition_audio_rows = int(history_audio_latents) * AUDIO_CHANNELS
     num_audio_rows = num_audio_latents * AUDIO_CHANNELS
     num_video_rows = num_latent_frames * rows_per_frame
-    seq_len = num_text + num_condition_rows + num_audio_rows + num_video_rows
+    seq_len = (
+        num_text + num_condition_rows + num_condition_audio_rows + num_audio_rows + num_video_rows
+    )
+    target_num_frames = (
+        (num_latent_frames - 2) // LATENTS_PER_CHUNK * FRAMES_PER_CHUNK + LATENTS_PER_CHUNK
+        if num_latent_frames % LATENTS_PER_CHUNK == 2
+        else None
+    )
 
     condition_start = num_text
-    audio_start = condition_start + num_condition_rows
+    keyframe_start = condition_start + num_history_rows
+    audio_condition_start = condition_start + num_condition_rows
+    audio_start = audio_condition_start + num_condition_audio_rows
     video_start = audio_start + num_audio_rows
+
+    # The media clock. Without history this is the reference's `num_text`; with history the target
+    # begins one history span later, so the carried frames sit just before it in time.
+    media_origin = float(num_text)
+    target_origin = media_origin + (
+        _temporal_position_span(history_latent_frames) if history_latent_frames else 0.0
+    )
 
     # 1. The (t, h, w) grid. Text rows sit on the time axis at their row index and the media rows
     #    continue from there, so text length shifts the whole media clock.
@@ -290,42 +351,58 @@ def build_packed_sequence(
     hh, ww = np.meshgrid(height_grid, width_grid, indexing="ij")
     frame_grid = np.stack([hh.reshape(-1), ww.reshape(-1)], axis=-1)
 
+    if history_latent_frames:
+        history_pos = np.empty((history_latent_frames, rows_per_frame, 3), dtype=np.float64)
+        history_pos[:, :, 0] = _temporal_position_grid(history_latent_frames, media_origin)[:, None]
+        history_pos[:, :, 1:] = frame_grid[None]
+        position_ids[condition_start:keyframe_start] = history_pos.reshape(-1, 3)
+
     for index, anchor in enumerate(keyframe_anchors):
-        if anchor == "first":
-            anchor_time = float(num_text)
-        elif anchor == "last":
+        kind, pixel = parse_anchor(anchor, target_num_frames)
+        if kind == "first":
+            anchor_time = target_origin
+        elif kind == "last":
             anchor_time = (
-                float(num_text) + _temporal_position_span(num_latent_frames) - _ROPE_FRAME_RESCALE
+                target_origin + _temporal_position_span(num_latent_frames) - _ROPE_FRAME_RESCALE
             )
         else:
-            raise ValueError(f"A keyframe anchor must be 'first' or 'last', got {anchor!r}.")
-        lo = condition_start + index * rows_per_frame
-        hi = condition_start + (index + 1) * rows_per_frame
+            anchor_time = target_origin + pixel * _ROPE_FRAME_RESCALE
+        lo = keyframe_start + index * rows_per_frame
+        hi = keyframe_start + (index + 1) * rows_per_frame
         position_ids[lo:hi, 0] = anchor_time
         position_ids[lo:hi, 1:] = frame_grid
 
     # Audio rows are channel-major and share the video's rotary clock: one unit per latent at
     # 40 latents/s equals 24 fps * 5/3. They carry no height coordinate and are pinned to the two
     # extremes of the width grid.
-    audio_time = float(num_text) + np.arange(num_audio_latents, dtype=np.float64)
-    position_ids[audio_start:video_start, 0] = np.tile(audio_time, AUDIO_CHANNELS)
-    position_ids[audio_start:video_start, 2] = np.concatenate(
-        [
-            np.full(num_audio_latents, float(width_grid[0]), dtype=np.float64),
-            np.full(num_audio_rows - num_audio_latents, float(width_grid[-1]), dtype=np.float64),
-        ]
+    def _place_audio(start: int, count: int, origin: float) -> None:
+        if not count:
+            return
+        stop = start + count * AUDIO_CHANNELS
+        times = origin + np.arange(count, dtype=np.float64)
+        position_ids[start:stop, 0] = np.tile(times, AUDIO_CHANNELS)
+        position_ids[start:stop, 2] = np.concatenate(
+            [
+                np.full(count, float(width_grid[0]), dtype=np.float64),
+                np.full(count * (AUDIO_CHANNELS - 1), float(width_grid[-1]), dtype=np.float64),
+            ]
+        )
+
+    _place_audio(
+        audio_condition_start, int(history_audio_latents), media_origin + float(history_audio_offset)
     )
+    _place_audio(audio_start, num_audio_latents, target_origin)
 
     video_pos = np.empty((num_latent_frames, rows_per_frame, 3), dtype=np.float64)
-    video_pos[:, :, 0] = _temporal_position_grid(num_latent_frames, float(num_text))[:, None]
+    video_pos[:, :, 0] = _temporal_position_grid(num_latent_frames, target_origin)[:, None]
     video_pos[:, :, 1:] = frame_grid[None]
     position_ids[video_start:] = video_pos.reshape(-1, 3)
 
-    # 2. Row indices and modality tags.
+    # 2. Row indices and modality tags. Conditioning rows lead each modality's index list.
     video_idx = np.concatenate(
-        [np.arange(condition_start, audio_start), np.arange(video_start, seq_len)]
+        [np.arange(condition_start, audio_condition_start), np.arange(video_start, seq_len)]
     )
-    audio_idx = np.arange(audio_start, video_start)
+    audio_idx = np.arange(audio_condition_start, video_start)
     text_idx = np.arange(num_text)
 
     tags = np.empty(seq_len, dtype=np.int64)
@@ -341,8 +418,15 @@ def build_packed_sequence(
         audio_indices=mx.array(audio_idx.astype(np.int32)),
         text_indices=mx.array(text_idx.astype(np.int32)),
         num_condition_video_rows=num_condition_rows,
-        num_condition_audio_rows=0,
+        num_condition_audio_rows=num_condition_audio_rows,
     )
+
+
+# Timestep of a FROZEN target row: clean data (t = 1 is sigma 0 in this checkpoint's convention).
+# A frozen row is part of the target — it sits on the target's own clock and is decoded with it —
+# but it is never stepped: the soundtrack a lip-sync render must follow, or the picture a
+# video-to-audio render must score.
+FROZEN_TARGET_TIMESTEP = 1.0
 
 
 def build_row_timesteps(
@@ -351,12 +435,18 @@ def build_row_timesteps(
     audio_timestep: float,
     condition_video_timestep: float,
     condition_audio_timestep: float,
+    frozen_video_rows: np.ndarray | None = None,
+    frozen_audio_rows: np.ndarray | None = None,
+    frozen_video_timestep: float = FROZEN_TARGET_TIMESTEP,
 ) -> tuple[mx.array, mx.array]:
     """Assign a timestep to every row and reduce to the transformer's ``(timestep, indices)`` pair.
 
     One forward serves rows at different noise levels: generated video and audio rows step down
     their own schedules while conditioning rows stay pinned at their noise-augmentation level. Text
     rows never reach an output head and inherit the video timestep.
+
+    ``frozen_video_rows`` / ``frozen_audio_rows`` are boolean masks over the TARGET rows (in target
+    order) that are held clean at :data:`FROZEN_TARGET_TIMESTEP` instead of following a schedule.
 
     Returns:
         The distinct timesteps, sorted, and the index of every row into them.
@@ -372,6 +462,18 @@ def build_row_timesteps(
     rows[video_idx[:n_cond_v]] = float(condition_video_timestep)
     rows[audio_idx[n_cond_a:]] = float(audio_timestep)
     rows[audio_idx[:n_cond_a]] = float(condition_audio_timestep)
+    if frozen_video_rows is not None:
+        mask = np.asarray(frozen_video_rows, dtype=bool)
+        target = video_idx[n_cond_v:]
+        if mask.shape != target.shape:
+            raise ValueError(f"frozen_video_rows {mask.shape} does not match {target.shape} targets")
+        rows[target[mask]] = float(frozen_video_timestep)
+    if frozen_audio_rows is not None:
+        mask = np.asarray(frozen_audio_rows, dtype=bool)
+        target = audio_idx[n_cond_a:]
+        if mask.shape != target.shape:
+            raise ValueError(f"frozen_audio_rows {mask.shape} does not match {target.shape} targets")
+        rows[target[mask]] = FROZEN_TARGET_TIMESTEP
 
     distinct, inverse = np.unique(rows, return_inverse=True)
     return mx.array(distinct.astype(np.float32)), mx.array(inverse.astype(np.int32))

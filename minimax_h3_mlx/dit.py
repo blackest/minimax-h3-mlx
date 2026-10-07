@@ -462,7 +462,12 @@ class MiniMaxH3DiT(nn.Module):
             text_indices,
         )
 
+        skip = getattr(self, "skip_blocks", None) or ()
         for i, block in enumerate(self.blocks):
+            if i in skip:
+                # Gate-ranked layer skipping (opt-in, `--skip-blocks`): the residual stream passes
+                # through untouched. Empty by default, so every existing render is unchanged.
+                continue
             modulation = (
                 modulation_cache.get(i) if modulation_cache is not None else block.adaln_proj(temb)
             )

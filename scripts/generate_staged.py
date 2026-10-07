@@ -15,6 +15,7 @@ import sys
 import time
 import traceback
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import mlx.core as mx
@@ -47,7 +48,19 @@ from minimax_h3_mlx.load import (
     load_compact_video_vae,
     load_dit,
 )
-from minimax_h3_mlx.media import probe_video_frames, save_mp4
+from minimax_h3_mlx.media import (
+    mux_audio_onto_video,
+    probe_video_frames,
+    read_audio,
+    read_video_frames,
+    save_mp4,
+)
+from minimax_h3_mlx.conditioning import (
+    encode_audio_rows,
+    encode_video_rows,
+    frozen_row_mask,
+    gate_ranked_skip_blocks,
+)
 from minimax_h3_mlx.packing import (
     AUDIO_CHANNELS,
     FPS,
@@ -154,14 +167,23 @@ def build_schedules(points: int, config: PipelineConfig, subset=None):
     return video, audio
 
 
-def row_timestep_plan(layout, video_timesteps, audio_timesteps):
+# Timestep a held picture's rows run at (video-to-audio). 1.0 = clean target; the research knob
+# H3_FROZEN_VIDEO_T lets an A/B try the keyframe level (0.999) instead.
+import os as _os
+
+FROZEN_VIDEO_TIMESTEP = float(_os.environ.get("H3_FROZEN_VIDEO_T", "1.0"))
+
+
+def row_timestep_plan(layout, video_timesteps, audio_timesteps, frozen_video=None, frozen_audio=None):
     per_step = []
     for t, at in zip(video_timesteps.tolist(), audio_timesteps.tolist()):
         # Keyframe rows are pinned at their noise-augmentation level for the whole run. With no
         # keyframe the layout has no conditioning rows, so the extra level never appears in the
-        # table and the schedule is unchanged.
+        # table and the schedule is unchanged. Frozen target rows (a supplied soundtrack or
+        # picture) sit at t = 1, clean, for every step.
         distinct, inverse = build_row_timesteps(
-            layout, float(t), float(at), max(float(t), KEYFRAME_NOISE_AUG), 1.0
+            layout, float(t), float(at), max(float(t), KEYFRAME_NOISE_AUG), 1.0,
+            frozen_video, frozen_audio, FROZEN_VIDEO_TIMESTEP,
         )
         per_step.append((np.array(distinct), np.array(inverse)))
     table = sorted({float(value) for distinct, _ in per_step for value in distinct})
@@ -249,6 +271,207 @@ def spread_joint_draft_clock(layout, text_rows: int, scale: float) -> None:
     layout.position_ids = mx.array(positions)
 
 
+AUDIO_RATE = 32000  # the audio VAE's rate; every waveform this runner handles is at it
+
+# The carried-context lengths a window can take: whole 17-frame VAE clips, so the history ends
+# exactly where the next target starts on the rotary clock.
+CONTEXT_FRAME_STEP = 17
+
+
+def fit_audio(wave: np.ndarray, frames: int) -> np.ndarray:
+    """Pad with silence or cut a ``(2, samples)`` waveform to exactly ``frames`` of 24 fps picture."""
+    want = round(frames / FPS * AUDIO_RATE)
+    wave = np.asarray(wave, dtype=np.float32)
+    if wave.ndim != 2 or wave.shape[0] != 2:
+        wave = np.zeros((2, 0), dtype=np.float32)
+    if wave.shape[1] < want:
+        wave = np.pad(wave, ((0, 0), (0, want - wave.shape[1])))
+    return np.ascontiguousarray(wave[:, :want])
+
+
+def frame_samples(frame: int) -> int:
+    """The audio sample at which 24 fps picture frame ``frame`` starts."""
+    return round(frame / FPS * AUDIO_RATE)
+
+
+def drive_slice(wave: np.ndarray, start_frame: int, num_frames: int) -> np.ndarray:
+    """``num_frames`` of picture's worth of ``wave`` starting at ``start_frame``, silence-padded."""
+    start = frame_samples(max(0, start_frame))
+    want = frame_samples(num_frames)
+    piece = np.asarray(wave[:, start : start + want], dtype=np.float32)
+    if piece.shape[1] < want:
+        piece = np.pad(piece, ((0, 0), (0, want - piece.shape[1])))
+    return np.ascontiguousarray(piece)
+
+
+def media_mode_errors(args, parser) -> str:
+    """Validate the media-conditioned flags together; return the run's mode name."""
+    if args.chain_context_frames < 0 or args.chain_context_frames % CONTEXT_FRAME_STEP:
+        parser.error(f"--chain-context-frames must be a multiple of {CONTEXT_FRAME_STEP} (0 = off)")
+    keyframes = list(args.keyframe or [])
+    media = [
+        name for name, value in (
+            ("--extend-from", args.extend_from),
+            ("--video-to-audio", args.video_to_audio),
+            ("--audio-drive", args.audio_drive),
+        ) if value is not None
+    ]
+    for flag, value in (("--extend-from", args.extend_from), ("--video-to-audio", args.video_to_audio),
+                        ("--audio-drive", args.audio_drive), ("--audio-mux", args.audio_mux),
+                        ("--last-frame", args.last_frame)):
+        if value is not None and not Path(value).is_file():
+            parser.error(f"{flag} does not exist: {value}")
+    if args.extend_frames is not None and args.extend_from is None:
+        parser.error("--extend-frames only applies with --extend-from")
+    if args.audio_mux is not None and args.audio_drive is None:
+        parser.error("--audio-mux only applies with --audio-drive")
+    if args.video_to_audio is not None and (
+        args.first_frame or args.last_frame or keyframes or args.extend_from or args.audio_drive
+    ):
+        parser.error("--video-to-audio keeps the picture it is given; it takes no keyframes, "
+                     "--extend-from or --audio-drive")
+    if args.extend_from is not None and (args.first_frame is not None or keyframes):
+        parser.error("--extend-from starts from the source's own last frame; pass --last-frame "
+                     "for an end target, not --first-frame/--keyframe")
+    if args.extend_from is not None and args.audio_drive is not None:
+        parser.error("--extend-from and --audio-drive do not compose (yet); extend, then lip-sync")
+    extra = media or args.last_frame is not None or keyframes or args.chain_context_frames
+    if extra:
+        for flag, value in (("--draft-fps", args.draft_fps), ("--playback-fps", args.playback_fps),
+                            ("--draft-seconds", args.draft_seconds),
+                            ("--draft-cache-dir", args.draft_cache_dir),
+                            ("--save-stage-a", args.save_stage_a)):
+            if value is not None:
+                parser.error(f"{flag} does not compose with keyframes, carried context or media "
+                             "conditioning")
+    if args.extend_from is not None and not args.chain_context_frames:
+        args.chain_context_frames = CONTEXT_FRAME_STEP
+    if args.video_to_audio is not None and not args.chain_context_frames:
+        args.chain_context_frames = CONTEXT_FRAME_STEP
+    if args.chain_context_frames >= align_num_frames(args.frames):
+        parser.error("--chain-context-frames must be shorter than a window")
+    for spec in keyframes:
+        path, _, when = str(spec).rpartition("@")
+        if not path or not when:
+            parser.error(f"--keyframe wants PATH@WHEN, got {spec!r}")
+        if not Path(path).is_file():
+            parser.error(f"--keyframe image does not exist: {path}")
+    if args.video_to_audio is not None:
+        return "video_to_audio"
+    if args.audio_drive is not None:
+        return "audio_drive"
+    if args.extend_from is not None:
+        return "extend"
+    if args.last_frame is not None or keyframes:
+        return "keyframes"
+    return "text" if args.first_frame is None else "first_frame"
+
+
+def resolve_keyframe_time(when: str, delivered: int) -> int:
+    """``'48'`` -> frame 48; ``'2.5s'`` -> the frame at 2.5 s; ``'-1'`` -> the last frame."""
+    when = str(when).strip().lower()
+    if when.endswith("s"):
+        frame = int(round(float(when[:-1]) * FPS))
+    else:
+        frame = int(when)
+    if frame < 0:
+        frame += delivered
+    if not 0 <= frame < delivered:
+        raise ValueError(f"keyframe time {when!r} is outside the clip's 0..{delivered - 1} frames")
+    return frame
+
+
+def window_of_frame(frame: int, window_frames: int) -> tuple[int, int]:
+    """Global frame -> (window, frame within that window) for a chain of ``window_frames`` windows.
+
+    Windows overlap by one frame (each opens on its predecessor's last frame), and that shared
+    frame belongs to the EARLIER window, where it is a real last frame — the later window would
+    only see it as the carried hand-over it already conditions on.
+    """
+    if frame <= 0:
+        return 0, 0
+    step = window_frames - 1
+    window = (frame - 1) // step
+    return window, frame - window * step
+
+
+def plan_keyframes(args, window_frames: int, chain: int, delivered: int) -> list[list[tuple[Path, int]]]:
+    """Route --first-frame / --keyframe / --last-frame to the windows that own them.
+
+    Returns one list per window of ``(image path, frame within the window)``, sorted by time.
+    Frame 0 of a window after the first is its carried hand-over, so a keyframe can only land
+    there in window 1.
+    """
+    plan: list[list[tuple[Path, int]]] = [[] for _ in range(chain)]
+    entries: list[tuple[int, Path]] = []
+    if args.first_frame is not None:
+        entries.append((0, Path(args.first_frame)))
+    for spec in args.keyframe or []:
+        path, _, when = str(spec).rpartition("@")
+        entries.append((resolve_keyframe_time(when, delivered), Path(path)))
+    if args.last_frame is not None:
+        entries.append((delivered - 1, Path(args.last_frame)))
+    seen: dict[int, Path] = {}
+    for frame, path in entries:
+        if frame in seen and seen[frame] != path:
+            raise ValueError(f"two keyframes land on frame {frame} ({seen[frame].name}, {path.name})")
+        seen[frame] = path
+    for frame, path in sorted(seen.items()):
+        window, local = window_of_frame(frame, window_frames)
+        if window >= chain:
+            raise ValueError(f"keyframe at frame {frame} is past the last window")
+        plan[window].append((path, local))
+    return plan
+
+
+def anchor_name(local: int, window_frames: int) -> str:
+    if local == 0:
+        return "first"
+    if local == window_frames - 1:
+        return "last"
+    return f"frame:{local}"
+
+
+_ALIGNMENT_PREFIXES = ("for the target video", "how the reference pictures")
+
+
+def alignment_line(anchors: list[str], window_frames: int, prompt: str) -> str | None:
+    """MiniMax's own keyframe-alignment sentence for this window's pictures, or None.
+
+    The official prompt guide opens a first+last (FL2VA) request with "How the reference pictures
+    align with the target video — Picture 1 ... aligns with the 0.00-second mark ...; Picture 2
+    ... aligns with the S.SS-second mark ..." and a last-frame-only one with the same sentence
+    for ``<Picture 1>``. A plain first-frame window gets nothing, exactly as before.
+    """
+    if not anchors or all(anchor == "first" for anchor in anchors):
+        return None
+    if prompt.lstrip().lower().startswith(_ALIGNMENT_PREFIXES):
+        return None
+    import re
+
+    shots = [int(n) for n in re.findall(r"\[Shot (\d+)\]", prompt)]
+    final_shot = max(shots) if shots else 1
+
+    def seconds(anchor: str) -> float:
+        if anchor == "first":
+            return 0.0
+        if anchor == "last":
+            return window_frames / FPS
+        return int(anchor.split(":", 1)[1]) / FPS
+
+    if anchors == ["last"]:
+        return (
+            "How the reference pictures align with the target video — <Picture 1> (from "
+            f"[Shot {final_shot}]) aligns with the {seconds('last'):.2f}-second mark of the target video."
+        )
+    parts = [
+        f"Picture {index} (from Shot {1 if anchor == 'first' else final_shot}) aligns with the "
+        f"{seconds(anchor):.2f}-second mark of the target video"
+        for index, anchor in enumerate(anchors, 1)
+    ]
+    return "How the reference pictures align with the target video — " + "; ".join(parts) + "."
+
+
 CHAIN_PROMPT_SEPARATOR = " ||| "
 
 # The shipped preview lengths all keep H3's native 24 fps motion/audio clock. Three and five
@@ -316,6 +539,22 @@ def parse_chain_prompts(spec: str, windows: int) -> list[str]:
     return prompts
 
 
+def resolve_skip_blocks(spec: str, cache, num_layers: int) -> list[int]:
+    """``--skip-blocks``: ``"auto:N"`` (the N smallest-gate blocks) or an explicit ``"3,17,22"``.
+
+    Blocks 0, 1 and the last are never skipped, whichever spelling asks for them.
+    """
+    spec = str(spec).strip()
+    protected = {0, 1, num_layers - 1}
+    if spec.startswith("auto:"):
+        return gate_ranked_skip_blocks(cache, num_layers, int(spec.split(":", 1)[1]))
+    blocks = sorted({int(part) for part in spec.split(",") if part.strip()})
+    bad = [b for b in blocks if b in protected or not 0 <= b < num_layers]
+    if bad:
+        raise ValueError(f"--skip-blocks cannot skip {bad} (0, 1 and {num_layers - 1} are kept)")
+    return blocks
+
+
 ADALN_SKIP_PREFIX = "adaLN projection"
 
 
@@ -359,7 +598,32 @@ def lora_accounting(data: dict, label: str, adaln_report: dict | None) -> dict:
     }
 
 
-def stitch_windows(segments, sample_rate: int, crossfade_seconds: float):
+def seam_colour_match(prev_last: np.ndarray, video: np.ndarray, frames: int) -> np.ndarray:
+    """Ease a new window's colour into its predecessor's over ``frames`` frames.
+
+    Every window is decoded on its own, and its re-render of the hand-over frame (``video[0]``,
+    dropped at the join) lands a percent or two off the frame it re-renders — a small, visible
+    exposure/tint step at the seam. The per-channel mean/std map that takes ``video[0]`` onto
+    ``prev_last`` is applied in full at the seam and faded to nothing over ``frames`` frames, so
+    the window drifts back to its own grade too slowly to see. Picture content is untouched.
+    """
+    if frames <= 0 or len(video) < 2:
+        return video
+    src = video[0].reshape(-1, 3).astype(np.float32)
+    ref = prev_last.reshape(-1, 3).astype(np.float32)
+    gain = (ref.std(0) + 1e-3) / (src.std(0) + 1e-3)
+    gain = np.clip(gain, 0.8, 1.25)
+    offset = ref.mean(0) - src.mean(0) * gain
+    out = video.astype(np.float32)
+    span = min(frames, len(video) - 1)
+    for k in range(0, span + 1):
+        w = 1.0 - k / float(span + 1)
+        out[k] = out[k] * (1.0 + (gain - 1.0) * w) + offset * w
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+
+def stitch_windows(segments, sample_rate: int, crossfade_seconds: float,
+                   colour_match_frames: int = 0):
     """Butt-join chained windows in pixel space and cross-fade their audio at every seam.
 
     Each window after the first opens on a re-render of its predecessor's last frame, so that
@@ -380,6 +644,8 @@ def stitch_windows(segments, sample_rate: int, crossfade_seconds: float):
     audio_parts = [segments[0][1]]
     seams = []
     for video, audio in segments[1:]:
+        if colour_match_frames:
+            video = seam_colour_match(video_parts[-1][-1], video, colour_match_frames)
         video_parts.append(video[1:])
         tail = audio_parts[-1]
         span = min(fade, tail.shape[1], frame_samples, audio.shape[1])
@@ -403,6 +669,51 @@ def stitch_windows(segments, sample_rate: int, crossfade_seconds: float):
     )
 
 
+@dataclass
+class WindowConditioning:
+    """Everything a window is conditioned on beyond its prompt.
+
+    ``keyframes``      (PIL image, anchor) pairs in packed order — ``"first"``, ``"last"`` or
+                       ``"frame:<i>"`` (pixel frame i of this window). The images are also shown
+                       to the text encoder's vision tower as ``<Picture n>``, in this order.
+    ``history_frames`` (17*m, H, W, 3) uint8 — the carried tail of the clip this window
+                       continues, ending on the frame BEFORE the window's first frame.
+    ``history_audio``  (2, samples) at 32 kHz covering the history frames AND the window's first
+                       frame (the boundary), so the carried sound ends where the carried picture
+                       hands over.
+    ``drive_audio``    (2, samples) — a soundtrack the window must follow: held clean in the
+                       target audio rows (lip-sync, a song). Silence past its end.
+    ``frozen_frames``  (F, H, W, 3) uint8 — a picture the window must keep: held clean in the
+                       target video rows (video-to-audio). Only the sound is generated.
+    """
+
+    keyframes: list = field(default_factory=list)
+    history_frames: np.ndarray | None = None
+    history_audio: np.ndarray | None = None
+    drive_audio: np.ndarray | None = None
+    frozen_frames: np.ndarray | None = None
+
+    @property
+    def decode_video(self) -> bool:
+        return self.frozen_frames is None
+
+    def summary(self) -> dict:
+        return {
+            "anchors": [anchor for _, anchor in self.keyframes],
+            "history_frames": 0 if self.history_frames is None else int(len(self.history_frames)),
+            "history_audio_seconds": (
+                0.0 if self.history_audio is None
+                else round(self.history_audio.shape[1] / 32000.0, 4)
+            ),
+            "drive_audio_seconds": (
+                None if self.drive_audio is None else round(self.drive_audio.shape[1] / 32000.0, 4)
+            ),
+            "frozen_video_frames": (
+                None if self.frozen_frames is None else int(len(self.frozen_frames))
+            ),
+        }
+
+
 def render_window(
     args,
     record,
@@ -416,6 +727,7 @@ def render_window(
     prompt_cache: Path | None,
     live_preview: LivePreviewMonitor | None = None,
     window_index: int = 1,
+    cond: WindowConditioning | None = None,
 ):
     """Render one window end to end and hand back decoded pixels, audio and the sample rate.
 
@@ -424,7 +736,15 @@ def render_window(
     phase names so a chained metrics file stays readable. ``prompt`` is this window's own text —
     a chain that scripts a line in one window must not encode that line in the others.
     """
-    keyframes = [keyframe] if keyframe is not None else None
+    if cond is None:
+        cond = WindowConditioning(keyframes=[(keyframe, "first")] if keyframe is not None else [])
+    keyframes = [image for image, _ in cond.keyframes] or None
+    keyframe_anchors = tuple(anchor for _, anchor in cond.keyframes)
+    if keyframe is None and keyframes:
+        # The draft cache keys on "the" first frame; it is only ever used with a plain first-frame
+        # window (media_mode_errors refuses it with anything richer).
+        keyframe = keyframes[0]
+    record.data[f"{label}conditioning"] = cond.summary()
     draft_cache = None
     text_request_key = None
     automatic_text = None
@@ -524,7 +844,7 @@ def render_window(
     condition_rows = None
     anchors: tuple[str, ...] = ()
     if keyframes is not None:
-        anchors = ("first",)
+        anchors = keyframe_anchors
         keyframe_key = None
         cached_keyframe = None
         if draft_cache is not None:
@@ -556,6 +876,59 @@ def render_window(
                         keyframe_key, np.array(condition_rows.astype(mx.float32))
                     )
                     record.data[f"{label}keyframe_cache_hit"] = False
+        release()
+
+    # Media conditioning: carried history and/or a frozen picture, encoded while only the video VAE
+    # is resident (it is unloaded again before the DiT lands, like the keyframe encode above).
+    history_rows = None
+    frozen_video_rows = None
+    if cond.history_frames is not None or cond.frozen_frames is not None:
+        with record.phase(f"{label}media_encode"):
+            media_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
+            if cond.history_frames is not None:
+                history_rows = encode_video_rows(
+                    media_vae, cond.history_frames, patch, sample=True
+                )
+            if cond.frozen_frames is not None:
+                frozen_video_rows = encode_video_rows(
+                    media_vae, cond.frozen_frames, patch, sample=False
+                )
+            print(
+                "media conditioning rows: "
+                f"history {None if history_rows is None else tuple(history_rows.shape)}, "
+                f"frozen picture {None if frozen_video_rows is None else tuple(frozen_video_rows.shape)}",
+                flush=True,
+            )
+        del media_vae
+        release()
+
+    history_audio_rows = None
+    history_audio_latents = 0
+    history_audio_offset = 0.0
+    drive_audio_rows = None
+    if cond.history_audio is not None or cond.drive_audio is not None:
+        with record.phase(f"{label}audio_encode"):
+            encode_vae = load_compact_audio_vae(args.compact_root / "audio_vae.safetensors")
+            hop = encode_vae.config.hop_length
+            rate = encode_vae.config.sampling_rate
+            if cond.history_audio is not None and cond.history_audio.shape[1] >= hop:
+                # Whole latents only, ending exactly where the carried picture hands over: the
+                # carried span is (history + boundary) frames, which need not be a whole number of
+                # 1/40 s latents, so the first one starts a fraction of a latent late instead.
+                span_units = cond.history_audio.shape[1] / rate * 40.0
+                history_audio_latents = int(np.floor(span_units + 1e-6))
+                history_audio_offset = float(span_units - history_audio_latents)
+                tail = cond.history_audio[:, -history_audio_latents * hop:]
+                history_audio_rows = encode_audio_rows(encode_vae, tail, history_audio_latents)
+            if cond.drive_audio is not None:
+                drive_audio_rows = encode_audio_rows(encode_vae, cond.drive_audio, audio_latents)
+            print(
+                f"audio conditioning: history {history_audio_latents} latents "
+                f"(offset {history_audio_offset:.3f}), "
+                f"soundtrack {'held' if drive_audio_rows is not None else 'generated'}",
+                flush=True,
+            )
+        del encode_vae
         release()
 
     # `--lora` repeats: every PATH[:SCALE] is one adapter, and they stack as a
@@ -603,9 +976,35 @@ def render_window(
                         for p, sc in lora_stack]
             record.flush()
 
+    if history_rows is not None:
+        # Packed order is [history | keyframes]: the carried frames come first on the clock and
+        # first in the conditioning block.
+        condition_rows = (
+            history_rows if condition_rows is None
+            else mx.concatenate([history_rows, condition_rows])
+        )
+    history_latent_frames = 0
+    if history_rows is not None:
+        history_latent_frames = int(history_rows.shape[0]) // ((latent_h // patch[1]) * (latent_w // patch[2]))
     layout = build_packed_sequence(
-        text_tags, latent_frames, latent_h, latent_w, audio_latents, patch, anchors
+        text_tags, latent_frames, latent_h, latent_w, audio_latents, patch, anchors,
+        history_latent_frames=history_latent_frames,
+        history_audio_latents=history_audio_latents,
+        history_audio_offset=history_audio_offset,
     )
+    n_target_video = int(layout.video_indices.shape[0]) - layout.num_condition_video_rows
+    n_target_audio = int(layout.audio_indices.shape[0]) - layout.num_condition_audio_rows
+    frozen_video_mask = None
+    if frozen_video_rows is not None:
+        if int(frozen_video_rows.shape[0]) != n_target_video:
+            raise ValueError(
+                f"the frozen picture encodes to {frozen_video_rows.shape[0]} rows, the window has "
+                f"{n_target_video}"
+            )
+        frozen_video_mask = np.ones(n_target_video, dtype=bool)
+    frozen_audio_mask = None
+    if drive_audio_rows is not None:
+        frozen_audio_mask = frozen_row_mask(n_target_audio, n_target_audio)
     if getattr(args, "draft_clock", "native") == "spread":
         spread_joint_draft_clock(layout, len(text_tags), args.draft_clock_scale)
         record.data[f"{label}draft_clock_scale"] = round(float(args.draft_clock_scale), 6)
@@ -629,7 +1028,8 @@ def render_window(
         print(f"schedule: video sigmas {[round(float(v), 4) for v in video_sched.sigmas.tolist()]}, "
               f"audio sigmas {[round(float(v), 4) for v in audio_sched.sigmas.tolist()]}", flush=True)
         timestep_table, plan = row_timestep_plan(
-            layout, video_sched.timesteps, audio_sched.timesteps
+            layout, video_sched.timesteps, audio_sched.timesteps,
+            frozen_video_mask, frozen_audio_mask,
         )
         adaln_key = None
         cached_adaln = None
@@ -693,6 +1093,12 @@ def render_window(
                       " (pass --lora-adaln TIME_EMBEDDER for adaLN pairs)")),
                 flush=True,
             )
+        skip_spec = getattr(args, "skip_blocks", None)
+        if skip_spec:
+            skipped_blocks = resolve_skip_blocks(skip_spec, cache, dit.config.num_layers)
+            dit.skip_blocks = frozenset(skipped_blocks)
+            record.data[f"{label}skip_blocks"] = skipped_blocks
+            print(f"skipping DiT blocks {skipped_blocks} ({skip_spec})", flush=True)
         freed = drop_adaln_weights(dit)
         mx.clear_cache()
         print(f"AdaLN cache {cache.nbytes()/1024**2:.1f} MiB; dropped {gb(freed):.2f} GiB")
@@ -746,11 +1152,25 @@ def render_window(
                 shift=config.sigma_shift_video
             ).scale_noise(condition_rows, KEYFRAME_NOISE_AUG, condition_noise)
         video_rows = patchify_video_latents(latents, patch)
+        frozen_video_values = None
+        if frozen_video_rows is not None:
+            # The supplied picture IS the target: held clean, decoded never (the source pixels are
+            # the delivery). The noise above was still drawn so a seed keeps its meaning.
+            frozen_video_values = frozen_video_rows.astype(mx.float32)
+            video_rows = frozen_video_values
+        frozen_audio_values = None
+        if drive_audio_rows is not None:
+            frozen_audio_values = drive_audio_rows.astype(mx.float32)
+            audio_rows = frozen_audio_values
         if condition_rows is not None:
             video_rows = mx.concatenate([condition_rows, video_rows])
+        if history_audio_rows is not None:
+            # Carried sound is clean (t = 1), exactly like a reference audio row.
+            audio_rows = mx.concatenate([history_audio_rows.astype(mx.float32), audio_rows])
         mx.eval(video_rows, audio_rows)
 
     n_cond_v = layout.num_condition_video_rows
+    n_cond_a = layout.num_condition_audio_rows
 
     if live_preview is not None:
         live_preview.start_window(
@@ -816,15 +1236,26 @@ def render_window(
             stepped_video = video_sched.step(
                 video_pred[n_cond_v:], float(timestep), video_rows[n_cond_v:]
             )
-            audio_rows = audio_sched.step(
-                audio_pred,
+            stepped_audio = audio_sched.step(
+                audio_pred[n_cond_a:],
                 float(audio_sched.timesteps[index].item()),
-                audio_rows,
+                audio_rows[n_cond_a:],
             )
+            # Frozen target rows are re-imposed after every step (the scheduler moved them along
+            # with everything else; their timestep said "clean", so the model never asked to).
+            if frozen_video_values is not None:
+                stepped_video = frozen_video_values
+            if frozen_audio_values is not None:
+                stepped_audio = frozen_audio_values
             video_rows = (
                 mx.concatenate([video_rows[:n_cond_v], stepped_video])
                 if n_cond_v
                 else stepped_video
+            )
+            audio_rows = (
+                mx.concatenate([audio_rows[:n_cond_a], stepped_audio])
+                if n_cond_a
+                else stepped_audio
             )
             # One scalar rides the same eval: a NaN/inf latent (an overflowing adapter, 2026-09-17)
             # stops the render at the step it appears instead of decoding to a black "success".
@@ -896,7 +1327,7 @@ def render_window(
             stored = save_stage_a(
                 stage_a_cache,
                 video_rows=np.array(video_rows[n_cond_v:].astype(mx.float32)),
-                audio_rows=np.array(audio_rows.astype(mx.float32)),
+                audio_rows=np.array(audio_rows[n_cond_a:].astype(mx.float32)),
                 embeds=np.array(embeds.astype(mx.float32)),
                 text_tags=np.asarray(text_tags),
                 meta={
@@ -928,7 +1359,11 @@ def render_window(
     del dit, cache, plan, timestep_table, video_sched, audio_sched
     release()
 
-    if getattr(args, "draft_decode", "full") == "tae":
+    if not cond.decode_video:
+        # Video-to-audio: the picture was held, so the delivery is the supplied pixels.
+        video = np.asarray(cond.frozen_frames[:frames], dtype=np.uint8)
+        del video_rows
+    elif getattr(args, "draft_decode", "full") == "tae":
         with record.phase(f"{label}video_tae_decode"):
             from minimax_h3_mlx.tiny_video_vae import load_tiny_h3_video_decoder
 
@@ -947,11 +1382,12 @@ def render_window(
             )
         del video_vae, video_rows
     release()
-    check_decoded_video(video, lora_stack)
+    if cond.decode_video:
+        check_decoded_video(video, lora_stack)
 
     with record.phase(f"{label}audio_vae_decode"):
         audio_vae = load_compact_audio_vae(args.compact_root / "audio_vae.safetensors")
-        audio = decode_audio(audio_vae, audio_rows, audio_latents, frames)
+        audio = decode_audio(audio_vae, audio_rows[n_cond_a:], audio_latents, frames)
         sample_rate = audio_vae.config.sampling_rate
     del audio_vae, audio_rows, embeds, layout
     release()
@@ -1070,6 +1506,101 @@ def main() -> int:
         default=None,
         help="FL2VA first-frame conditioning: the still is fed to the vision tower as part of the "
         "request and video-VAE encoded into the packed keyframe slot.",
+    )
+    parser.add_argument(
+        "--last-frame",
+        type=Path,
+        default=None,
+        help="FL2VA last-frame conditioning: the clip ends on this still. With --first-frame it is "
+        "the official first+last (FL2VA) task; on a chain it conditions the final window's last "
+        "delivered frame.",
+    )
+    parser.add_argument(
+        "--keyframe",
+        action="append",
+        default=None,
+        metavar="PATH@WHEN",
+        help="A timed keyframe: the clip passes through this still at WHEN — a delivered frame "
+        "index ('48') or seconds ('2.5s'). Repeat for several. Frame 0 is the first frame and the "
+        "last delivered frame is the last frame; anything between is pinned at its own instant "
+        "on the target's clock. On a chain each keyframe is routed to the window that owns it.",
+    )
+    parser.add_argument(
+        "--keyframe-alignment",
+        choices=("auto", "off"),
+        default="auto",
+        help="'auto' prepends MiniMax's official alignment line (Picture N aligns with the S.SS-second "
+        "mark of the target video) to a window that has a last-frame or timed keyframe and whose "
+        "prompt does not already carry one. A plain first-frame window is left exactly as before.",
+    )
+    parser.add_argument(
+        "--chain-context-frames",
+        type=int,
+        default=0,
+        metavar="K",
+        help="Carry the last K frames (a multiple of 17) of the previous window, plus their sound, "
+        "into the next window as conditioning placed just before it on the clock — so motion and "
+        "voice continue across the seam instead of restarting from one still. 0 (the default) is "
+        "the original one-frame hand-over. 17 is the tested value.",
+    )
+    parser.add_argument(
+        "--seam-colour-frames",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Ease each new window's colour onto the previous window's last frame over N frames "
+        "(each window decodes separately and lands a percent or two off). 0 = off; 24 is tested.",
+    )
+    parser.add_argument(
+        "--extend-from",
+        type=Path,
+        default=None,
+        metavar="VIDEO",
+        help="Continue an existing clip: its tail (frames + sound) conditions --chain-windows new "
+        "windows, and the output is the source followed by the continuation, on the render canvas. "
+        "Uses --chain-context-frames (17 when 0 is given).",
+    )
+    parser.add_argument(
+        "--extend-frames",
+        type=int,
+        default=None,
+        metavar="N",
+        help="With --extend-from: add exactly N frames after the source (trims the last new "
+        "window). Without it every new window is delivered whole.",
+    )
+    parser.add_argument(
+        "--audio-drive",
+        type=Path,
+        default=None,
+        metavar="AUDIO",
+        help="Lip-sync / music-driven video: this soundtrack is held in the target audio rows, so "
+        "the picture is generated to it. Each window gets its own slice. The delivered audio is "
+        "--audio-mux (default: this same file), never the VAE round trip.",
+    )
+    parser.add_argument("--audio-drive-offset", type=float, default=0.0, metavar="SECONDS")
+    parser.add_argument(
+        "--audio-mux",
+        type=Path,
+        default=None,
+        metavar="AUDIO",
+        help="With --audio-drive: the audio delivered in the mp4 (e.g. the full song when the drive "
+        "is its vocal stem). Same offset.",
+    )
+    parser.add_argument(
+        "--video-to-audio",
+        type=Path,
+        default=None,
+        metavar="VIDEO",
+        help="Generate sound for an existing clip: its frames are held in the target video rows and "
+        "only audio is denoised. The output is the source's own video stream with the new sound. "
+        "Long clips run as chained windows (sound carried across seams).",
+    )
+    parser.add_argument(
+        "--skip-blocks",
+        default=None,
+        metavar="SPEC",
+        help="EXPERIMENTAL speed lever: skip DiT blocks — 'auto:N' skips the N with the smallest "
+        "residual gates, or list them ('12,23,31'). Blocks 0, 1 and 49 are never skipped.",
     )
     parser.add_argument("-o", "--output", type=Path, required=True)
     parser.add_argument("--metrics", type=Path, required=True)
@@ -1334,6 +1865,7 @@ def main() -> int:
             "--save-stage-a holds one window's latents; with a chain every window would overwrite "
             "the last. Cache a single-window render."
         )
+    media_mode = media_mode_errors(args, parser)
     requested_frames = align_num_frames(args.frames)
     draft_delivery_frames = int(args.frames) if args.draft_fps is not None else requested_frames
     frames = (
@@ -1345,8 +1877,37 @@ def main() -> int:
         args.output = args.output.with_name(
             f"{args.output.stem}_{args.draft_fps}fps{args.output.suffix}"
         )
+    # Source media for the media-conditioned modes, read once, on the render canvas.
+    source_video = source_audio = drive_wave = mux_wave = None
+    try:
+        if args.video_to_audio is not None:
+            source_video = read_video_frames(args.video_to_audio, args.width, args.height)
+            # The clip decides the shape: as many windows as it takes to cover it, trimmed to it.
+            args.chain_windows = 1 + -(-max(0, len(source_video) - frames) // (frames - 1))
+            args.chain_total_frames = len(source_video)
+        if args.extend_from is not None:
+            source_video = read_video_frames(args.extend_from, args.width, args.height)
+            source_audio = fit_audio(read_audio(args.extend_from), len(source_video))
+        if args.audio_drive is not None:
+            drive_wave = read_audio(args.audio_drive, start_seconds=args.audio_drive_offset)
+            if drive_wave.shape[1] < AUDIO_RATE // 4:
+                parser.error(f"--audio-drive {args.audio_drive} has no usable audio")
+            mux_wave = (
+                read_audio(args.audio_mux, start_seconds=args.audio_drive_offset)
+                if args.audio_mux is not None else drive_wave
+            )
+    except RuntimeError as exc:
+        parser.error(str(exc))
     chain = args.chain_windows
-    chain_frames = frames + (chain - 1) * (frames - 1)
+    if args.extend_from is not None:
+        # The source is "window 0": every new window drops its duplicated hand-over frame.
+        chain_frames = len(source_video) + chain * (frames - 1)
+        if args.extend_frames is not None:
+            if args.extend_frames < 1:
+                parser.error("--extend-frames must be at least 1")
+            args.chain_total_frames = min(chain_frames, len(source_video) + args.extend_frames)
+    else:
+        chain_frames = frames + (chain - 1) * (frames - 1)
     if args.chain_total_frames is not None and not 1 <= args.chain_total_frames <= chain_frames:
         parser.error(f"--chain-total-frames must be in 1..{chain_frames} for this chain")
     delivered_frames = (
@@ -1355,6 +1916,15 @@ def main() -> int:
         else (args.chain_total_frames or chain_frames)
     )
     args.draft_clock_scale = delivered_frames / frames if args.draft_fps is not None else 1.0
+    # The new part's own timeline: frame 0 is the first frame this render conditions (the source's
+    # last frame when extending), so keyframes and soundtrack slices are counted from there.
+    timeline_offset = (len(source_video) - 1) if args.extend_from is not None else 0
+    try:
+        window_keyframes = plan_keyframes(
+            args, frames, chain, delivered_frames - timeline_offset
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.chain_prompts is not None:
         if args.prompt is not None:
@@ -1441,6 +2011,21 @@ def main() -> int:
         "chain_frames": chain_frames,
         "chain_delivered_frames": delivered_frames,
         "chain_audio_crossfade": args.chain_audio_crossfade if chain > 1 else None,
+        "media_mode": media_mode,
+        "chain_context_frames": int(args.chain_context_frames or 0),
+        "first_frame": str(args.first_frame) if args.first_frame else None,
+        "last_frame": str(args.last_frame) if args.last_frame else None,
+        "keyframes": list(args.keyframe or []),
+        "keyframe_alignment": args.keyframe_alignment,
+        "extend_from": str(args.extend_from) if args.extend_from else None,
+        "extend_source_frames": (
+            len(source_video) if args.extend_from is not None and source_video is not None else None
+        ),
+        "audio_drive": str(args.audio_drive) if args.audio_drive else None,
+        "audio_drive_offset": args.audio_drive_offset if args.audio_drive else None,
+        "audio_mux": str(args.audio_mux) if args.audio_mux else None,
+        "video_to_audio": str(args.video_to_audio) if args.video_to_audio else None,
+        "skip_blocks": args.skip_blocks,
         # Which video-VAE decode mode produced this run, so a metrics file is self-describing
         # when someone compares decode phases across the campaign. 0/1 is the per-tile loop.
         "vae_decode_dtype": resolved_decode_dtype(),
@@ -1501,26 +2086,91 @@ def main() -> int:
         segments = []
         step_times = []
         window_report = []
-        for index in range(chain):
-            label = "" if chain == 1 else f"w{index + 1}_"
-            if index == 0:
-                keyframe = base_keyframe
-                first_frame_key = str(args.first_frame) if args.first_frame else ""
-                prompt_cache = args.prompt_cache
-            else:
+        context = int(args.chain_context_frames or 0)
+        if source_video is not None and args.extend_from is not None:
+            # The source is window 0 of the timeline; it is delivered as decoded (on the canvas).
+            segments.append((source_video, source_audio))
+        keyframe_images: dict[Path, object] = {}
+
+        def keyframe_image(path: Path):
+            if path not in keyframe_images:
                 from PIL import Image
 
-                # The chain, in one line: the previous window's last decoded frame re-enters as this
-                # window's first-frame keyframe. The ordinary keyframe path VAE-encodes it,
-                # noises it to 0.999 and RoPE-anchors it to frame 0 of the new timeline, so
-                # nothing inside the denoiser knows it is in a chain. It is already on the
-                # canvas, so no resampling pass stands between one window and the next.
-                keyframe = Image.fromarray(segments[-1][0][-1])
+                from minimax_h3_mlx.packing import prepare_keyframe_image
+
+                # The first-frame still keeps the original stretch contract (the panel pre-fits
+                # it); every other still is cover-cropped, the reference's rule for a follower.
+                keyframe_images[path] = (
+                    base_keyframe if (args.first_frame is not None and path == Path(args.first_frame))
+                    else prepare_keyframe_image(
+                        Image.open(path).convert("RGB"), args.height, args.width, stretch=False
+                    )
+                )
+            return keyframe_images[path]
+
+        for index in range(chain):
+            label = "" if chain == 1 else f"w{index + 1}_"
+            from PIL import Image
+
+            cond = WindowConditioning()
+            window_start = index * (frames - 1)  # frame 0 of this window on the new timeline
+            continuing = bool(segments)
+            first_frame_key = ""
+            prompt_cache = None
+            if args.video_to_audio is not None:
+                # The picture is given: hold it, show its first frame to the text encoder too.
+                frozen = source_video[window_start : window_start + frames]
+                if len(frozen) < frames:
+                    frozen = np.concatenate(
+                        [frozen, np.repeat(frozen[-1:], frames - len(frozen), axis=0)]
+                    )
+                cond.frozen_frames = frozen
+                cond.keyframes.append((Image.fromarray(frozen[0]), "first"))
+                first_frame_key = f"<video-to-audio window {index + 1}>"
+                if index and context:
+                    k = min(context, window_start) // CONTEXT_FRAME_STEP * CONTEXT_FRAME_STEP
+                    if k:
+                        cond.history_frames = source_video[window_start - k : window_start]
+                        prev_audio = segments[-1][1]
+                        cond.history_audio = prev_audio[:, -frame_samples(k + 1):]
+            elif continuing:
+                # The chain, in one line: the previous window's last decoded frame re-enters as
+                # this window's first-frame keyframe. With carried context the frames before it —
+                # and their sound — ride along as history rows just before the target on the
+                # clock, so motion and voice continue instead of restarting from one still.
+                prev_video, prev_audio = segments[-1]
+                cond.keyframes.append((Image.fromarray(prev_video[-1]), "first"))
                 first_frame_key = f"<chain window {index}>"
-                # The keyframe changes every window and its vision tokens with it, so a prompt cache
-                # keyed on (prompt, first frame) can only ever hit on window 1 — per-window prompts
-                # do not change that, they only give the cache a second reason to miss.
-                prompt_cache = None
+                k = min(context, len(prev_video) - 1) // CONTEXT_FRAME_STEP * CONTEXT_FRAME_STEP
+                if k:
+                    cond.history_frames = prev_video[-(k + 1) : -1]
+                    cond.history_audio = (
+                        drive_slice(drive_wave, window_start - k, k + 1)
+                        if drive_wave is not None
+                        else prev_audio[:, -frame_samples(k + 1):]
+                    )
+            for path, local in window_keyframes[index]:
+                if continuing and local == 0:
+                    continue  # the carried hand-over already owns frame 0
+                cond.keyframes.append((keyframe_image(path), anchor_name(local, frames)))
+            if index == 0 and not continuing and args.video_to_audio is None:
+                anchors_now = [anchor for _, anchor in cond.keyframes]
+                if anchors_now in ([], ["first"]):
+                    # Exactly the old contract, so the prompt cache stays valid.
+                    first_frame_key = str(args.first_frame) if args.first_frame else ""
+                    prompt_cache = args.prompt_cache
+            if drive_wave is not None:
+                cond.drive_audio = drive_slice(drive_wave, window_start, frames)
+            # Packed order is time order: first, then timed frames, then last.
+            order = {"first": -1, "last": 10**9}
+            cond.keyframes.sort(
+                key=lambda item: order.get(item[1], int(item[1].split(":")[1]) if ":" in item[1] else 0)
+            )
+            window_prompt = prompts[index]
+            if args.keyframe_alignment == "auto":
+                line = alignment_line([anchor for _, anchor in cond.keyframes], frames, window_prompt)
+                if line:
+                    window_prompt = f"{line}\n\n{window_prompt.lstrip()}"
             started = time.perf_counter()
             if chain > 1:
                 print(f"\n### window {index + 1}/{chain} ###", flush=True)
@@ -1528,17 +2178,19 @@ def main() -> int:
                 args,
                 record,
                 label=label,
-                prompt=prompts[index],
+                prompt=window_prompt,
                 frames=frames,
                 # A fresh seed per window: identical starting noise under a changed keyframe
                 # correlates the windows' composition and camera motion, which is the one thing a
                 # chain must not do.
                 seed=args.seed + index,
-                keyframe=keyframe,
+                keyframe=None,
                 first_frame_key=first_frame_key,
                 prompt_cache=prompt_cache,
-                live_preview=live_preview,
+                # The x0 preview of a held picture is the picture; nothing to watch.
+                live_preview=live_preview if cond.decode_video else None,
                 window_index=index + 1,
+                cond=cond,
             )
             segments.append((video, audio))
             step_times.extend(window_steps)
@@ -1548,7 +2200,9 @@ def main() -> int:
                     "seed": args.seed + index,
                     "seconds": round(time.perf_counter() - started, 3),
                     "keyframe": first_frame_key or None,
-                    "prompt": prompts[index],
+                    "anchors": [anchor for _, anchor in cond.keyframes],
+                    "context_frames": 0 if cond.history_frames is None else len(cond.history_frames),
+                    "prompt": window_prompt,
                 }
             )
             record.data["windows"] = window_report
@@ -1559,13 +2213,18 @@ def main() -> int:
                 save_mp4(window_path, video, float(FPS), audio, sample_rate, crf=args.crf)
             release()
 
-        with record.phase("encode_mux" if chain == 1 else "stitch_and_mux"):
+        with record.phase("encode_mux" if len(segments) == 1 else "stitch_and_mux"):
             args.output.parent.mkdir(parents=True, exist_ok=True)
             playback = float(args.playback_fps or FPS)
             audio_tempo = playback / FPS
-            if chain > 1:
+            # More than one segment = a seam to stitch: a chain, or a source clip
+            # with its continuation (--extend-from, where the source is segment 0).
+            if len(segments) > 1:
                 video, audio, seams = stitch_windows(
-                    segments, sample_rate, max(0.0, args.chain_audio_crossfade)
+                    segments, sample_rate, max(0.0, args.chain_audio_crossfade),
+                    colour_match_frames=(
+                        0 if args.video_to_audio is not None else args.seam_colour_frames
+                    ),
                 )
                 video = video[:delivered_frames]
                 audio = audio[:, : round(delivered_frames / FPS * sample_rate)]
@@ -1577,6 +2236,15 @@ def main() -> int:
                 )
             else:
                 video, audio = segments[0]
+                if args.draft_fps is None and delivered_frames < len(video):
+                    # A single window lands on its exact length too (a lip-sync of a 2.9 s line
+                    # renders the 3 s window and delivers 2.9 s of it).
+                    video = video[:delivered_frames]
+                    audio = audio[:, : round(delivered_frames / FPS * sample_rate)]
+            if mux_wave is not None:
+                # Lip-sync: deliver the soundtrack the user gave (the full mix when the drive was a
+                # vocal stem), sample-exact, never the VAE round trip of it.
+                audio = fit_audio(mux_wave, len(video))
             audio_stretch_script = None
             audio_output_frames = None
             if args.draft_fps is not None:
@@ -1597,17 +2265,21 @@ def main() -> int:
                 # never ends short of the picture; save_mp4 cuts the audio at exactly
                 # frames / fps (it no longer relies on `-shortest`, which dropped a frame).
                 audio_output_frames = round((delivered_frames / FPS + 0.05) * sample_rate)
-            save_mp4(
-                args.output,
-                video,
-                playback,
-                audio,
-                sample_rate,
-                crf=args.crf,
-                audio_tempo=audio_tempo,
-                audio_stretch_script=audio_stretch_script,
-                audio_output_frames=audio_output_frames,
-            )
+            if args.video_to_audio is not None:
+                # The source's own video stream, untouched, with the generated sound.
+                mux_audio_onto_video(args.video_to_audio, audio, sample_rate, args.output)
+            else:
+                save_mp4(
+                    args.output,
+                    video,
+                    playback,
+                    audio,
+                    sample_rate,
+                    crf=args.crf,
+                    audio_tempo=audio_tempo,
+                    audio_stretch_script=audio_stretch_script,
+                    audio_output_frames=audio_output_frames,
+                )
             if args.frames_dir is not None:
                 from minimax_h3_mlx.media import save_frames
 
@@ -1616,6 +2288,9 @@ def main() -> int:
             # What the FILE holds, not what the array held: a mux that drops a frame must show
             # up here rather than be reported as a full delivery.
             encoded_frames = probe_video_frames(args.output)
+            if args.video_to_audio is not None:
+                # The delivery is the source's stream (its own frame rate); count what was copied.
+                video = video if encoded_frames is None else video[:encoded_frames]
             if encoded_frames is not None and encoded_frames != len(video):
                 print(f"WARNING: encoded {encoded_frames} frames, decoded {len(video)}",
                       flush=True)

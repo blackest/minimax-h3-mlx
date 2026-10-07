@@ -152,3 +152,149 @@ def save_frames(directory: str | Path, video: np.ndarray, limit: int | None = No
     for index in range(count):
         Image.fromarray(video[index]).save(directory / f"frame_{index:05d}.png")
     return directory
+
+
+# -- reading media back in (continuation, lip-sync, video-to-audio) ---------------------------
+
+
+def _require(tool: str) -> str:
+    found = shutil.which(tool)
+    if found is None:
+        raise RuntimeError(f"{tool} not found on PATH; it is needed to read input media.")
+    return found
+
+
+def probe_media(path: str | Path) -> dict:
+    """``{"width", "height", "frames", "fps", "duration", "has_audio"}`` of a media file.
+
+    ``frames`` counts decoded packets of the first video stream (what a player shows); a file
+    with no video stream reports 0 frames and its audio duration.
+    """
+    ffprobe = _require("ffprobe")
+    import json as _json
+
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-show_streams", "-show_format", "-count_packets",
+         "-of", "json", str(path)],
+        capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe could not read {path}: {result.stderr.strip()[:300]}")
+    data = _json.loads(result.stdout or "{}")
+    info = {"width": 0, "height": 0, "frames": 0, "fps": 0.0, "duration": 0.0, "has_audio": False}
+    try:
+        info["duration"] = float((data.get("format") or {}).get("duration") or 0.0)
+    except (TypeError, ValueError):
+        pass
+    for stream in data.get("streams") or []:
+        if stream.get("codec_type") == "video" and not info["width"]:
+            info["width"] = int(stream.get("width") or 0)
+            info["height"] = int(stream.get("height") or 0)
+            try:
+                info["frames"] = int(stream.get("nb_read_packets") or stream.get("nb_frames") or 0)
+            except (TypeError, ValueError):
+                info["frames"] = 0
+            num, _, den = str(stream.get("avg_frame_rate") or "0/1").partition("/")
+            try:
+                info["fps"] = float(num) / float(den or 1)
+            except (ValueError, ZeroDivisionError):
+                info["fps"] = 0.0
+        elif stream.get("codec_type") == "audio":
+            info["has_audio"] = True
+    return info
+
+
+def read_video_frames(
+    path: str | Path,
+    width: int,
+    height: int,
+    fps: float = 24.0,
+    max_frames: int | None = None,
+) -> np.ndarray:
+    """Decode a clip to ``(F, height, width, 3)`` uint8 at ``fps``, cover-scaled onto the canvas.
+
+    Cover = scale until both axes are filled, then centre-crop, so the picture keeps its
+    proportions (the same rule the panel uses to put a reference image on an H3 canvas). The
+    timeline is resampled to ``fps`` with ffmpeg's ``fps`` filter, which drops or repeats frames
+    rather than blending them, so every frame is a real frame of the source.
+    """
+    ffmpeg = _require("ffmpeg")
+    vf = (
+        f"fps={fps:g},scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={width}:{height}"
+    )
+    cmd = [ffmpeg, "-v", "error", "-i", str(path), "-vf", vf, "-an"]
+    if max_frames is not None:
+        cmd += ["-frames:v", str(int(max_frames))]
+    cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg could not decode {path}: {result.stderr.decode()[:300]}")
+    frame_bytes = width * height * 3
+    count = len(result.stdout) // frame_bytes
+    if count < 1:
+        raise RuntimeError(f"{path} decoded to no video frames")
+    return np.frombuffer(result.stdout[: count * frame_bytes], dtype=np.uint8).reshape(
+        count, height, width, 3
+    ).copy()
+
+
+def read_audio(
+    path: str | Path,
+    sample_rate: int = 32000,
+    start_seconds: float = 0.0,
+    duration_seconds: float | None = None,
+) -> np.ndarray:
+    """Decode any media's first audio stream to ``(2, samples)`` float32 in [-1, 1].
+
+    Mono is duplicated to both channels; a file with no audio stream returns an empty
+    ``(2, 0)`` array (the caller decides whether silence is acceptable).
+    """
+    ffmpeg = _require("ffmpeg")
+    cmd = [ffmpeg, "-v", "error"]
+    if start_seconds > 0:
+        cmd += ["-ss", f"{start_seconds:.6f}"]
+    cmd += ["-i", str(path)]
+    if duration_seconds is not None:
+        cmd += ["-t", f"{max(0.0, duration_seconds):.6f}"]
+    cmd += ["-vn", "-ac", "2", "-ar", str(int(sample_rate)), "-f", "f32le", "pipe:1"]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        stderr = result.stderr.decode()
+        if "does not contain any stream" in stderr or "Output file #0 does not contain" in stderr \
+                or "matches no streams" in stderr:
+            return np.zeros((2, 0), dtype=np.float32)
+        raise RuntimeError(f"ffmpeg could not decode audio from {path}: {stderr[:300]}")
+    data = np.frombuffer(result.stdout, dtype="<f4")
+    if data.size % 2:
+        data = data[:-1]
+    return np.ascontiguousarray(data.reshape(-1, 2).T.astype(np.float32))
+
+
+def mux_audio_onto_video(
+    source: str | Path, audio: np.ndarray, sample_rate: int, output: str | Path
+) -> Path:
+    """Copy ``source``'s video stream untouched and give it ``audio`` as its only soundtrack.
+
+    The picture is never re-encoded (``-c:v copy``), so a video-to-audio render returns the
+    exact pixels it was given. The audio is padded or cut to the video's own duration.
+    """
+    ffmpeg = _require("ffmpeg")
+    output = Path(output)
+    wav = output.with_suffix(".wav")
+    save_wav(wav, audio, sample_rate)
+    duration = probe_media(source)["duration"]
+    # `apad` alone never ends, so it only rides with the trim that bounds it.
+    audio_filter = (
+        ["-filter:a", f"apad,atrim=duration={duration:.6f}"] if duration > 0 else ["-shortest"]
+    )
+    cmd = [
+        ffmpeg, "-y", "-loglevel", "error", "-i", str(source), "-i", str(wav),
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+        *audio_filter, "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", str(output),
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg mux failed: {result.stderr.decode()[:500]}")
+    return output
