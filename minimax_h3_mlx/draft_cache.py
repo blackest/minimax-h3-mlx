@@ -35,6 +35,14 @@ def path_fingerprint(path: str | Path | None) -> dict | None:
         return None
     resolved = Path(path).resolve()
     stat = resolved.stat()
+    if resolved.is_dir():
+        # A directory's own mtime does not change when a shard inside it is replaced in place, so
+        # a sharded DiT is identified by its files (name, size, mtime) instead.
+        files = sorted(p for p in resolved.iterdir()
+                       if p.is_file() and p.suffix in (".safetensors", ".json") and not p.name.startswith("."))
+        listing = [(p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in files]
+        return {"path": str(resolved), "count": len(listing),
+                "files_sha256": hashlib.sha256(json.dumps(listing).encode()).hexdigest()}
     return {"path": str(resolved), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 

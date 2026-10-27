@@ -1088,16 +1088,26 @@ def render_window(
             layout, video_sched.timesteps, audio_sched.timesteps,
             frozen_video_mask, frozen_audio_mask,
         )
+        # `--adaln-cache-dir` gives ordinary (non-draft) renders the same AdaLN table cache the
+        # draft path has. On a hit the ~24 GiB of AdaLN projections are never read at all (under
+        # --lazy-adaln, which the flag implies, they are still unread file references and are
+        # simply dropped); on a miss the tables are built block by block and stored.
+        adaln_cache = draft_cache
+        adaln_cache_dir = getattr(args, "adaln_cache_dir", None)
+        if adaln_cache is None and adaln_cache_dir is not None:
+            from minimax_h3_mlx.draft_cache import DraftCache
+
+            adaln_cache = DraftCache(adaln_cache_dir, getattr(args, "adaln_cache_limit", 20))
         adaln_key = None
         cached_adaln = None
-        if draft_cache is not None:
-            adaln_key = draft_cache.adaln_key(
+        if adaln_cache is not None:
+            adaln_key = adaln_cache.adaln_key(
                 timestep_table=np.array(timestep_table),
                 dit=args.dit,
                 lora=lora_stack or None,
                 lora_adaln=args.lora_adaln,
             )
-            cached_adaln = draft_cache.load_adaln(adaln_key, dit)
+            cached_adaln = adaln_cache.load_adaln(adaln_key, dit)
         if cached_adaln is not None:
             cache, adaln_report = cached_adaln
             record.data[f"{label}adaln_cache_hit"] = True
@@ -1134,8 +1144,8 @@ def render_window(
                         ModulationCache.remember_lora_report(adaln_report)
                 record.data[f"{label}lora_adaln"] = adaln_report
                 record.flush()
-            if draft_cache is not None:
-                draft_cache.store_adaln(adaln_key, cache, dit, adaln_report)
+            if adaln_cache is not None:
+                adaln_cache.store_adaln(adaln_key, cache, dit, adaln_report)
                 record.data[f"{label}adaln_cache_hit"] = False
         if lora_stack and not getattr(args, "lora_already_applied", False):
             accounting = lora_accounting(record.data, label, adaln_report)
@@ -1159,7 +1169,11 @@ def render_window(
             print(f"skipping DiT blocks {skipped_blocks} ({skip_spec})", flush=True)
         freed = drop_adaln_weights(dit) + getattr(cache, "dropped_bytes", 0)
         mx.clear_cache()
-        print(f"AdaLN cache {cache.nbytes()/1024**2:.1f} MiB; dropped {gb(freed):.2f} GiB")
+        if cached_adaln is not None:
+            print(f"AdaLN cache HIT {cache.nbytes()/1024**2:.1f} MiB; the {gb(freed):.2f} GiB of AdaLN weights were "
+                  + ("never read" if getattr(args, "lazy_adaln", False) else "loaded but unused (add --lazy-adaln)"))
+        else:
+            print(f"AdaLN cache {cache.nbytes()/1024**2:.1f} MiB; dropped {gb(freed):.2f} GiB")
         # Draw order matches the reference pipeline: conditioning noise first, then video,
         # then audio, so a seed reproduces the same run with and without the staged loader.
         video_noise_shape = (1, dit.config.latents_dim, latent_frames, latent_h, latent_w)
@@ -1549,6 +1563,22 @@ def main() -> int:
         help="Maximum LRU entries per draft cache class (default: 50).",
     )
     parser.add_argument(
+        "--adaln-cache-dir",
+        type=Path,
+        default=None,
+        help="Cache the AdaLN modulation tables on disk for ordinary (non-draft) renders, keyed by "
+        "the sigma schedule, the DiT files and the LoRA stack. The first render with a schedule "
+        "builds and stores them; later ones skip reading the ~24 GiB of AdaLN weights entirely. "
+        "Implies --lazy-adaln unless --lora-adaln is used.",
+    )
+    parser.add_argument(
+        "--adaln-cache-limit",
+        type=int,
+        default=20,
+        help="Maximum cached AdaLN schedules kept, oldest dropped first (default: 20; each is "
+        "about 0.1-0.6 GB).",
+    )
+    parser.add_argument(
         "--draft-seconds",
         type=int,
         choices=tuple(DRAFT_DURATION_PRESETS),
@@ -1901,6 +1931,11 @@ def main() -> int:
         parser.error("--draft-cache-dir is draft-only; pass --draft-decode tae")
     if args.draft_cache_limit < 1:
         parser.error("--draft-cache-limit must be at least 1")
+    if args.adaln_cache_limit < 1:
+        parser.error("--adaln-cache-limit must be at least 1")
+    if args.adaln_cache_dir is not None and args.lora_adaln is None:
+        # A hit only saves the weights' memory and disk read if they were never loaded.
+        args.lazy_adaln = True
     if args.draft_seconds is not None:
         if args.draft_decode != "tae":
             parser.error("--draft-seconds is draft-only; pass --draft-decode tae")
@@ -2067,6 +2102,8 @@ def main() -> int:
         ),
         "draft_cache_dir": str(args.draft_cache_dir) if args.draft_cache_dir else None,
         "draft_cache_limit": args.draft_cache_limit if args.draft_cache_dir else None,
+        "adaln_cache_dir": str(args.adaln_cache_dir) if args.adaln_cache_dir else None,
+        "lazy_adaln": bool(getattr(args, "lazy_adaln", False)),
         "draft_seconds": args.draft_seconds,
         "save_stage_a": str(args.save_stage_a) if args.save_stage_a else None,
         "frames": frames,
