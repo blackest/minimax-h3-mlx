@@ -980,7 +980,7 @@ def render_window(
     precision = dit_precision(args.dit)
     record.data[f"{label}dit_precision"] = precision
     with record.phase(f"{label}dit_load_{precision}"):
-        dit = load_dit(args.dit, verbose=True)
+        dit = load_dit(args.dit, verbose=True, lazy_adaln=getattr(args, "lazy_adaln", False))
         patch = dit.config.patch_size
         lora_spec = getattr(args, "lora", None)
         lora_specs = [lora_spec] if isinstance(lora_spec, (str, Path)) else list(lora_spec or [])
@@ -1104,7 +1104,8 @@ def render_window(
             if adaln_report is not None:
                 record.data[f"{label}lora_adaln"] = adaln_report
         else:
-            cache = ModulationCache.build(dit, timestep_table, dtype=mx.bfloat16)
+            cache = ModulationCache.build(dit, timestep_table, dtype=mx.bfloat16,
+                                          drop_projections=getattr(args, "lazy_adaln", False))
             mx.eval(cache.tables)
             adaln_report = None
             if lora_stack and getattr(args, "lora_adaln", None):
@@ -1156,7 +1157,7 @@ def render_window(
             dit.skip_blocks = frozenset(skipped_blocks)
             record.data[f"{label}skip_blocks"] = skipped_blocks
             print(f"skipping DiT blocks {skipped_blocks} ({skip_spec})", flush=True)
-        freed = drop_adaln_weights(dit)
+        freed = drop_adaln_weights(dit) + getattr(cache, "dropped_bytes", 0)
         mx.clear_cache()
         print(f"AdaLN cache {cache.nbytes()/1024**2:.1f} MiB; dropped {gb(freed):.2f} GiB")
         # Draw order matches the reference pipeline: conditioning noise first, then video,
@@ -1715,6 +1716,13 @@ def main() -> int:
         help="'runtime' keeps the low-rank product as its own matmul (~1.5%% of a linear's FLOPs). "
         "'fuse' merges W += scale*(B@A) into the base weight at load — measured to lose ~87%% of "
         "this update to bfloat16 rounding, so it exists as a control arm, not a fast path.",
+    )
+    parser.add_argument(
+        "--lazy-adaln",
+        action="store_true",
+        help="Do not load the ~24 GiB of AdaLN projections up front: read each block's, build its "
+        "modulation table and free it. Halves the DiT load peak (44 to ~20 GiB for Q8) and the "
+        "tables are bit-identical. Off by default.",
     )
     parser.add_argument(
         "--lora-adaln",

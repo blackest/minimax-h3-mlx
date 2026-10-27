@@ -57,24 +57,35 @@ class ModulationCache:
         dit,
         timesteps: mx.array,
         dtype: mx.Dtype = mx.bfloat16,
+        drop_projections: bool = False,
     ) -> "ModulationCache":
         """Precompute the modulation table for every block.
 
         Args:
-            dit: a ``MiniMaxH3DiT`` whose ``adaln_proj`` weights are still loaded.
+            dit: a ``MiniMaxH3DiT`` whose ``adaln_proj`` weights are still loaded (or, with
+                ``load_dit(..., lazy_adaln=True)``, still unread).
             timesteps: ``(T,)`` the distinct noise levels, unscaled in ``[0, 1]``.
             dtype: storage dtype of the cache. bfloat16 halves the footprint and matches the
                 precision the modulation is consumed at inside the block stack.
+            drop_projections: free each block's projection as soon as its table is built, so a
+                lazily loaded DiT never holds more than one block's projection at a time. The
+                bytes freed are left on ``cache.dropped_bytes``. The tables are bit-identical
+                either way.
         """
         temb = dit.embed_timesteps(timesteps)
         mx.eval(temb)
 
         tables: list[tuple[mx.array, ...]] = []
+        dropped = 0
         for block in dit.blocks:
             table = tuple(t.astype(dtype) for t in block.adaln_proj(temb))
             mx.eval(table)
             tables.append(table)
-        return cls(tables, timesteps)
+            if drop_projections:
+                dropped += _drop_block_projection(block)
+        cache = cls(tables, timesteps)
+        cache.dropped_bytes = dropped
+        return cache
 
 
 def final_layer_modulation(dit, timesteps: mx.array, dtype: mx.Dtype = mx.bfloat16):
@@ -104,14 +115,18 @@ def drop_adaln_weights(dit) -> int:
     dropping only ``weight`` and ``bias`` would strand them and under-report the saving, so every
     array the layer holds is removed.
     """
+    return sum(_drop_block_projection(block) for block in dit.blocks)
+
+
+def _drop_block_projection(block) -> int:
+    """Delete one block's ``adaln_proj`` arrays and return the bytes freed (0 if already gone)."""
     freed = 0
-    for block in dit.blocks:
-        linear = block.adaln_proj.linear
-        for name in ("weight", "bias", "scales", "biases"):
-            param = getattr(linear, name, None)
-            if isinstance(param, mx.array):
-                freed += param.nbytes
-                delattr(linear, name)
+    linear = block.adaln_proj.linear
+    for name in ("weight", "bias", "scales", "biases"):
+        param = getattr(linear, name, None)
+        if isinstance(param, mx.array):
+            freed += param.nbytes
+            delattr(linear, name)
     return freed
 
 

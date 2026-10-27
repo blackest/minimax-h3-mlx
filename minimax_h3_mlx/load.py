@@ -14,6 +14,7 @@ error accumulates coherently along the denoising trajectory.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -35,6 +36,9 @@ FP32_PREFIXES = (
 
 # Carried by the checkpoint but recomputed by the port.
 SKIP_KEYS = ("rope.inv_freq",)
+
+# The per-block AdaLN projections: ~24 GiB that ModulationCache consumes once and drops.
+_BLOCK_ADALN_KEY = re.compile(r"^blocks\.\d+\.adaln_proj\.")
 
 
 def is_fp32_key(key: str) -> bool:
@@ -96,6 +100,7 @@ def load_dit(
     dtype: mx.Dtype | None = None,
     strict: bool = True,
     verbose: bool = False,
+    lazy_adaln: bool = False,
 ) -> MiniMaxH3DiT:
     """Load the 33B DiT from a released ``FL2VA/transformer`` (or ``Ref2VA/transformer``) directory.
 
@@ -105,6 +110,11 @@ def load_dit(
             mixed float32/bfloat16 split, which is what the reference runs.
         strict: raise if the checkpoint and the module tree disagree on any key.
         verbose: print per-shard progress.
+        lazy_adaln: leave the per-block ``adaln_proj`` projections (~24 GiB) as unread file
+            references instead of materializing them. Pair it with
+            ``ModulationCache.build(..., drop_projections=True)``, which reads each block's
+            projection, builds that block's table and frees it, so they are never all resident.
+            Only effective with ``dtype=None``; a dtype cast evaluates every tensor as it loads.
 
     Returns:
         A parameter-loaded :class:`MiniMaxH3DiT`.
@@ -185,7 +195,11 @@ def load_dit(
         )
 
     model.update(tree_unflatten(list(weights.items())))
-    mx.eval(model.parameters())
+    if lazy_adaln:
+        mx.eval([value for key, value in tree_flatten(model.parameters())
+                 if not _BLOCK_ADALN_KEY.match(key)])
+    else:
+        mx.eval(model.parameters())
     return model
 
 
